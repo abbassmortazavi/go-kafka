@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"go-kafka/kafka"
 	"log"
 	"os"
 	"os/signal"
@@ -16,11 +17,15 @@ import (
 )
 
 func main() {
-	nodID := flag.String("node", "node-1", "not node ID for this instance")
+	//nodID := flag.String("node", "node-1", "not node ID for this instance")
 	port := flag.String("port", "3000", "port to listen on")
 	kafkaAddress := flag.String("kafka", "127.0.0.1:29092", "kafka address")
 	flag.Parse()
 
+	//wait for kafka to ready
+	if err := kafka.WaitForKafka(*kafkaAddress, 30*time.Second); err != nil {
+		log.Fatalf("kafka wait for kafka failed: %v", err)
+	}
 	app := fiber.New(fiber.Config{
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
@@ -51,3 +56,5 @@ func main() {
 		log.Fatal(err)
 	}
 }
+
+//section 5=>9 finished

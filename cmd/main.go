@@ -17,7 +17,7 @@ import (
 )
 
 func main() {
-	//nodID := flag.String("node", "node-1", "not node ID for this instance")
+	nodID := flag.String("node", "node-1", "not node ID for this instance")
 	port := flag.String("port", "3000", "port to listen on")
 	kafkaAddress := flag.String("kafka", "127.0.0.1:29092", "kafka address")
 	flag.Parse()
@@ -38,12 +38,19 @@ func main() {
 		AllowHeaders: []string{"Origin", "Accept", "Content-Type", "Content-Length", "Accept-Encoding", "X-CSRF-Token"},
 	}))
 
+	//Create Heartbeat Manager
+	heartbeatManager, err := kafka.NewHeartBeatManager(*kafkaAddress, *nodID)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	sigchan := make(chan os.Signal, 1)
 	signal.Notify(sigchan, syscall.SIGINT, syscall.SIGALRM)
 
 	go func() {
 		sig := <-sigchan
 		fmt.Println("shutting down on signal", sig)
+		heartbeatManager.Stop()
 		err := app.ShutdownWithTimeout(10 * time.Second)
 		if err != nil {
 			return
@@ -57,4 +64,4 @@ func main() {
 	}
 }
 
-//section 5=>11 22:25
+//section 6=>11 finished

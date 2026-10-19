@@ -16,17 +16,17 @@ type NodeHartBeat struct {
 	UserIDs   []string `json:"user_ids"`
 }
 
-type ChatHub interface {
-	GetConnectedUserIDs() []string
-	PublishUserStatus(userID, nodeID string, online bool) error
-	GetClientLock() *sync.Mutex
-	GetClients() map[string]interface{}
-}
+//type ChatHub interface {
+//	GetConnectedUserIDs() []string
+//	PublishUserStatus(userID, nodeID string, online bool) error
+//	GetClientLock() *sync.Mutex
+//	GetClients() map[string]interface{}
+//}
 
 type HeartBeatManager struct {
-	mutex              sync.Mutex
-	nodeID             string
-	hub                ChatHub
+	mutex  sync.Mutex
+	nodeID string
+	//hub                ChatHub
 	kafkaWriter        *kafka.Writer
 	heartBeatReader    *kafka.Reader
 	nodeLastSeen       map[string]int64
@@ -38,7 +38,8 @@ type HeartBeatManager struct {
 	cancel             context.CancelFunc
 }
 
-func NewHeartBeatManager(kafkaAddr, nodeID string, hub ChatHub) (*HeartBeatManager, error) {
+// func NewHeartBeatManager(kafkaAddr, nodeID string, hub ChatHub) (*HeartBeatManager, error) {
+func NewHeartBeatManager(kafkaAddr, nodeID string) (*HeartBeatManager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	km := NewKafkaManager(kafkaAddr)
 	if err := km.EnsureTopics([]string{"node-heartbeat"}); err != nil {
@@ -63,8 +64,8 @@ func NewHeartBeatManager(kafkaAddr, nodeID string, hub ChatHub) (*HeartBeatManag
 		CommitInterval: time.Second,
 	})
 	hm := &HeartBeatManager{
-		nodeID:             nodeID,
-		hub:                hub,
+		nodeID: nodeID,
+		//hub:                hub,
 		kafkaWriter:        writer,
 		heartBeatReader:    reader,
 		nodeLastSeen:       make(map[string]int64),
@@ -82,6 +83,7 @@ func NewHeartBeatManager(kafkaAddr, nodeID string, hub ChatHub) (*HeartBeatManag
 		return nil, err
 	}
 	//sendHeatBeats
+	go hm.sendheatbeats()
 	//listenToHeartBeats
 	//monitorNodeHealth
 	//cleanUpOldDeadNodes
@@ -96,7 +98,7 @@ func (hbm *HeartBeatManager) rebuildNodeStateFromAllPartitions(kafkaAddr string)
 		if err != nil {
 			return err
 		}
-		if event.Type == "node_heatbeat" {
+		if event.Type == "node_heartbeat" {
 			var heartbeat NodeHartBeat
 			err = json.Unmarshal(event.Data, &heartbeat)
 			if err != nil {
@@ -120,4 +122,67 @@ func (hbm *HeartBeatManager) rebuildNodeStateFromAllPartitions(kafkaAddr string)
 	}
 	hbm.mutex.Unlock()
 	return nil
+}
+
+func (hbm *HeartBeatManager) sendheatbeats() {
+	ticker := time.NewTicker(hbm.heartBeatInterval)
+	defer ticker.Stop()
+	log.Printf("Starting to send heatbeats for node: %s...", hbm.nodeID)
+	for {
+		select {
+		case <-hbm.ctx.Done():
+			log.Printf("HeartBeat sender shutting down")
+			return
+		case <-ticker.C:
+			if err := hbm.publishHeartbeat(); err != nil {
+				log.Printf("HeartBeat sender failed: %v", err)
+			}
+
+		}
+
+	}
+}
+func (hbm *HeartBeatManager) publishHeartbeat() error {
+	userIDs := []string{"user-1", "user-2", "user-3"}
+	//userIDs := hbm.hub.GetConnectedUserIDs()
+	heartbeat := NodeHartBeat{
+		NodeID:    hbm.nodeID,
+		Timestamp: time.Now().Unix(),
+		UserIDs:   userIDs,
+	}
+	data, err := json.Marshal(heartbeat)
+	if err != nil {
+		return err
+	}
+	event := Event{
+		Type: "node_heartbeat",
+		Data: json.RawMessage(data),
+	}
+	eventBytes, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	msg := kafka.Message{
+		Key:   []byte(hbm.nodeID),
+		Value: eventBytes,
+	}
+	if err := hbm.kafkaWriter.WriteMessages(ctx, msg); err != nil {
+		return err
+	}
+	log.Printf("HeartBeat sent: node=%s, user=%d", hbm.nodeID, len(userIDs))
+	return nil
+
+}
+func (hbm *HeartBeatManager) Stop() {
+	log.Printf("Stopping HeartBeat manager")
+	hbm.cancel()
+	if hbm.kafkaWriter != nil {
+		hbm.kafkaWriter.Close()
+	}
+	if hbm.heartBeatReader != nil {
+		hbm.heartBeatReader.Close()
+	}
+	log.Printf("HeartBeat Manager stopped")
 }

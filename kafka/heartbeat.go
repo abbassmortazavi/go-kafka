@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -24,7 +25,7 @@ type NodeHartBeat struct {
 //}
 
 type HeartBeatManager struct {
-	mutex  sync.Mutex
+	mutex  sync.RWMutex
 	nodeID string
 	//hub                ChatHub
 	kafkaWriter        *kafka.Writer
@@ -85,6 +86,7 @@ func NewHeartBeatManager(kafkaAddr, nodeID string) (*HeartBeatManager, error) {
 	//sendHeatBeats
 	go hm.sendheatbeats()
 	//listenToHeartBeats
+	go hm.listenToHeartBeats()
 	//monitorNodeHealth
 	//cleanUpOldDeadNodes
 	log.Printf("HeartBeat Manager initialized for node: %s", nodeID)
@@ -185,4 +187,120 @@ func (hbm *HeartBeatManager) Stop() {
 		hbm.heartBeatReader.Close()
 	}
 	log.Printf("HeartBeat Manager stopped")
+}
+
+func (hbm *HeartBeatManager) listenToHeartBeats() {
+	log.Printf("HeartBeat Manager listening to heartbeats")
+	for {
+		select {
+		case <-hbm.ctx.Done():
+			log.Printf("HeartBeat sender shutting down")
+			return
+		default:
+		}
+
+		msg, err := hbm.heartBeatReader.ReadMessage(hbm.ctx)
+		if err != nil {
+			if err == context.Canceled {
+				log.Printf("HeartBeat sender failed: %v", err)
+				return
+			}
+			log.Printf("HeartBeat error : %v, retring in is", err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		var event Event
+		if err := json.Unmarshal(msg.Value, &event); err != nil {
+			log.Printf("error unmarshaling heartbeat event : %v", err)
+			continue
+		}
+		if event.Type == "node_heartbeat" {
+			var heartbeat NodeHartBeat
+			if err := json.Unmarshal(event.Data, &heartbeat); err != nil {
+				log.Printf("error unmarshaling heartbeat event : %v", err)
+				continue
+			}
+			hbm.handleHeartBeat(heartbeat)
+
+		}
+
+	}
+}
+
+func (hbm *HeartBeatManager) handleHeartBeat(heartbeat NodeHartBeat) {
+	hbm.mutex.Lock()
+	defer hbm.mutex.Unlock()
+	hbm.nodeLastSeen[heartbeat.NodeID] = heartbeat.Timestamp
+	hbm.nodeUsers[heartbeat.NodeID] = heartbeat.UserIDs
+
+	if hbm.processedDeadNodes[heartbeat.NodeID] {
+		log.Printf("Node %s is Alive again! removing from dead list.", heartbeat.NodeID)
+		delete(hbm.processedDeadNodes, heartbeat.NodeID)
+	}
+	log.Printf("Heartbeat receive: node=%s, users=%d, timestamp=%d", heartbeat.NodeID, len(heartbeat.UserIDs), heartbeat.Timestamp)
+}
+
+func (hbm *HeartBeatManager) monitorNodeHealth() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	log.Printf("HeartBeat Manager monitoring node health started")
+	for {
+		select {
+		case <-hbm.ctx.Done():
+			log.Printf("Node Health monitoring manager shutting down")
+			return
+		case <-ticker.C:
+			hbm.checkDeadNodes()
+		}
+	}
+}
+func (hbm *HeartBeatManager) checkDeadNodes() {
+	now := time.Now().Unix()
+	timeoutSeconds := int64(hbm.timeoutThreshold.Seconds())
+	hbm.mutex.Lock()
+	var deadNodes []string
+	for nodeID, lastSeen := range hbm.nodeLastSeen {
+		if nodeID == hbm.nodeID {
+			continue
+		}
+		timeSinceLastSeen := now - lastSeen
+		if timeSinceLastSeen > timeoutSeconds {
+			if !hbm.processedDeadNodes[nodeID] {
+				deadNodes = append(deadNodes, nodeID)
+				log.Printf("Node %s is Dead(last seen %d seconds ago)", nodeID, timeSinceLastSeen)
+			}
+		}
+	}
+	hbm.mutex.Unlock()
+	if len(deadNodes) > 0 {
+		if hbm.shouldHandelFailure(deadNodes) {
+
+		}
+	}
+}
+func (hbm *HeartBeatManager) shouldHandelFailure(nodes []string) bool {
+	hbm.mutex.RLock()
+	defer hbm.mutex.RUnlock()
+	aliveNodes := []string{hbm.nodeID}
+	now := time.Now().Unix()
+	timeoutSeconds := int64(hbm.timeoutThreshold.Seconds())
+	for nodeID, lastSeen := range hbm.nodeLastSeen {
+		if nodeID == hbm.nodeID {
+			continue
+		}
+		timeSinceLastSeen := now - lastSeen
+		if timeSinceLastSeen <= timeoutSeconds {
+			aliveNodes = append(aliveNodes, nodeID)
+		}
+	}
+	sort.Strings(aliveNodes)
+	if len(aliveNodes) == 0 {
+		return true
+	}
+	designatedNode := aliveNodes[0]
+	isDesignated := designatedNode == hbm.nodeID
+	if isDesignated {
+		log.Printf("Node %s is Designated", designatedNode)
+	}
+	return false
 }

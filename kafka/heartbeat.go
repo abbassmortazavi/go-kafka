@@ -17,6 +17,7 @@ type NodeHartBeat struct {
 	UserIDs   []string `json:"user_ids"`
 }
 
+//TODO:: return back
 //type ChatHub interface {
 //	GetConnectedUserIDs() []string
 //	PublishUserStatus(userID, nodeID string, online bool) error
@@ -41,6 +42,7 @@ type HeartBeatManager struct {
 
 // func NewHeartBeatManager(kafkaAddr, nodeID string, hub ChatHub) (*HeartBeatManager, error) {
 func NewHeartBeatManager(kafkaAddr, nodeID string) (*HeartBeatManager, error) {
+	log.Printf("bootstrap address = %q", kafkaAddr)
 	ctx, cancel := context.WithCancel(context.Background())
 	km := NewKafkaManager(kafkaAddr)
 	if err := km.EnsureTopics([]string{"node-heartbeat"}); err != nil {
@@ -88,7 +90,9 @@ func NewHeartBeatManager(kafkaAddr, nodeID string) (*HeartBeatManager, error) {
 	//listenToHeartBeats
 	go hm.listenToHeartBeats()
 	//monitorNodeHealth
+	go hm.monitorNodeHealth()
 	//cleanUpOldDeadNodes
+	go hm.cleanUpOldDeadNodes()
 	log.Printf("HeartBeat Manager initialized for node: %s", nodeID)
 	return hm, nil
 }
@@ -145,7 +149,7 @@ func (hbm *HeartBeatManager) sendheatbeats() {
 	}
 }
 func (hbm *HeartBeatManager) publishHeartbeat() error {
-	userIDs := []string{"user-1", "user-2", "user-3"}
+	userIDs := []string{""}
 	//userIDs := hbm.hub.GetConnectedUserIDs()
 	heartbeat := NodeHartBeat{
 		NodeID:    hbm.nodeID,
@@ -273,12 +277,30 @@ func (hbm *HeartBeatManager) checkDeadNodes() {
 	}
 	hbm.mutex.Unlock()
 	if len(deadNodes) > 0 {
-		if hbm.shouldHandelFailure(deadNodes) {
-
+		if hbm.shouldHandelFailure() {
+			for _, nodeID := range deadNodes {
+				hbm.HandelDeadNode(nodeID)
+			}
+		} else {
+			log.Printf("Not handeling dead nodes: %v - another node is responsible", deadNodes)
 		}
 	}
 }
-func (hbm *HeartBeatManager) shouldHandelFailure(nodes []string) bool {
+func (hbm *HeartBeatManager) HandelDeadNode(nodeID string) {
+	hbm.mutex.Lock()
+	usersIDs := hbm.nodeUsers[nodeID]
+	hbm.processedDeadNodes[nodeID] = true
+	hbm.mutex.Unlock()
+	if len(usersIDs) == 0 {
+		log.Printf("Dead node %s has no users", nodeID)
+		return
+	}
+	log.Printf("Handeling dead node: %s : Marking %d users as offline.", nodeID, len(usersIDs))
+	for _, userID := range usersIDs {
+		log.Printf("User %s marked offline (from dead node: %s)", userID, nodeID)
+	}
+}
+func (hbm *HeartBeatManager) shouldHandelFailure() bool {
 	hbm.mutex.RLock()
 	defer hbm.mutex.RUnlock()
 	aliveNodes := []string{hbm.nodeID}
@@ -300,7 +322,45 @@ func (hbm *HeartBeatManager) shouldHandelFailure(nodes []string) bool {
 	designatedNode := aliveNodes[0]
 	isDesignated := designatedNode == hbm.nodeID
 	if isDesignated {
-		log.Printf("Node %s is Designated", designatedNode)
+		log.Printf("This Node (%s) is Designated to handel dead nodes (alive noded: %v)", hbm.nodeID, aliveNodes)
 	}
-	return false
+	return isDesignated
+}
+
+func (hbm *HeartBeatManager) cleanUpOldDeadNodes() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	log.Printf("Dead Node CleanUp Service Started")
+	for {
+		select {
+		case <-hbm.ctx.Done():
+			log.Printf("Dead Node CleanUp Service Stopped")
+			return
+		case <-ticker.C:
+			now := time.Now().Unix()
+			cleanupThereshould := int64(5 * 60)
+			hbm.mutex.Lock()
+			var nodeToCleanup []string
+			for nodeID, lastSeen := range hbm.nodeLastSeen {
+				if nodeID == hbm.nodeID {
+					continue
+				}
+				timeSinceLastSeen := now - lastSeen
+				if timeSinceLastSeen > cleanupThereshould && hbm.processedDeadNodes[nodeID] {
+					nodeToCleanup = append(nodeToCleanup, nodeID)
+				}
+			}
+			// remove old dead nodes from memory
+			for _, nodeID := range nodeToCleanup {
+				log.Printf("forgetting old dead node: %s (last seen %d) seconds ago", nodeID, now-hbm.nodeLastSeen[nodeID])
+				delete(hbm.nodeLastSeen, nodeID)
+				delete(hbm.nodeUsers, nodeID)
+				delete(hbm.processedDeadNodes, nodeID)
+			}
+			hbm.mutex.Unlock()
+			if len(nodeToCleanup) > 0 {
+				log.Printf("Removing old dead nodes: %v", len(nodeToCleanup))
+			}
+		}
+	}
 }
